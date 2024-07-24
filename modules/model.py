@@ -130,7 +130,12 @@ class XFeatModel(nn.Module):
 				heatmap   ->  torch.Tensor(B,  1, H/8, W/8) reliability map
 
 		"""
-		#dont backprop through normalization
+		# x = x.to('cpu').float() / 255.0
+		# H, W = x.shape[-2:]
+		# _H, _W = (H // 32) * 32, (W // 32) * 32
+		# rh1, rw1 = H / _H, W / _W
+		# x = F.interpolate(x, (_H, _W), mode='bilinear', align_corners=False)
+        #dont backprop through normalization
 		with torch.no_grad():
 			x = x.mean(dim=1, keepdim = True)
 			x = self.norm(x)

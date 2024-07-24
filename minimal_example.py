@@ -9,41 +9,86 @@ import numpy as np
 import os
 import torch
 import tqdm
+import cv2
+from time import time
+
 
 from modules.xfeat import XFeat
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '' #Force CPU, comment for GPU
+# os.environ['CUDA_VISIBLE_DEVICES'] = '' #Force CPU, comment for GPU
+
+
+def putText(canvas, text, org, fontFace, fontScale, textColor, borderColor, thickness, lineType):
+    # Draw the border
+    cv2.putText(img=canvas, text=text, org=org, fontFace=fontFace, fontScale=fontScale, 
+                color=borderColor, thickness=thickness+2, lineType=lineType)
+    # Draw the text
+    cv2.putText(img=canvas, text=text, org=org, fontFace=fontFace, fontScale=fontScale, 
+                color=textColor, thickness=thickness, lineType=lineType)
+    
+def numpy_image_to_torch(image: np.ndarray) -> torch.Tensor:
+    """Normalize the image tensor and reorder the dimensions."""
+    if image.ndim == 3:
+        image = image.transpose((2, 0, 1))  # HxWxC to CxHxW
+    elif image.ndim == 2:
+        image = image[None]  # add channel axis
+    else:
+        raise ValueError(f"Not an image: {image.shape}")
+    return torch.tensor(image / 255.0, dtype=torch.float)
+
+
 
 xfeat = XFeat()
 
-#Random input
-x = torch.randn(1,3,480,640)
+# 读取 assets 文件夹内图片
+# img1 = cv2.imread("assets/sacre_coeur1.jpg")
+# img2 = cv2.imread("assets/sacre_coeur2.jpg")
+img1 = cv2.imread("assets/ref.png")
+img2 = cv2.imread("assets/tgt.png")
+t0 = time()
+total_time = 0
 
-#Simple inference with batch = 1
-output = xfeat.detectAndCompute(x, top_k = 4096)[0]
-print("----------------")
-print("keypoints: ", output['keypoints'].shape)
-print("descriptors: ", output['descriptors'].shape)
-print("scores: ", output['scores'].shape)
-print("----------------\n")
+for i in range(10):
+    matches = xfeat.match_xfeat_star(img1, img2, top_k = 200)
+    points1 = matches[0]
+    points2 = matches[1]
 
-x = torch.randn(1,3,480,640)
-# Stress test
-for i in tqdm.tqdm(range(100), desc="Stress test on VGA resolution"):
-	output = xfeat.detectAndCompute(x, top_k = 4096)
+    # 计算特征
+    # output1 = xfeat.detectAndCompute(torch.tensor(img1).permute(2,0,1).float()[None], top_k = 800)[0]
+    # output2 = xfeat.detectAndCompute(torch.tensor(img2).permute(2,0,1).float()[None], top_k = 800)[0]
+    # output1 = xfeat.detectAndComputeDense(torch.tensor(img1).permute(2,0,1).float()[None], top_k = 800)[0]
+    # output2 = xfeat.detectAndComputeDense(torch.tensor(img2).permute(2,0,1).float()[None], top_k = 800)[0]
+    # kpts1, descs1 = output1['keypoints'], output1['descriptors']
+    # kpts2, descs2 = output2['keypoints'], output2['descriptors']
 
-# Batched mode
-x = torch.randn(4,3,480,640)
-outputs = xfeat.detectAndCompute(x, top_k = 4096)
-print("# detected features on each batch item:", [len(o['keypoints']) for o in outputs])
+    # 匹配特征
+    # idx1, idx2 = xfeat.match(descs1, descs2, 0.82)
 
-# Match two images with sparse features
-x1 = torch.randn(1,3,480,640)
-x2 = torch.randn(1,3,480,640)
-mkpts_0, mkpts_1 = xfeat.match_xfeat(x1, x2)
+    # points1 = kpts1[idx1].cpu().numpy()
+    # points2 = kpts2[idx2].cpu().numpy()
 
-# Match two images with semi-dense approach -- batched mode with batch size 4
-x1 = torch.randn(4,3,480,640)
-x2 = torch.randn(4,3,480,640)
-matches_list = xfeat.match_xfeat_star(x1, x2)
-print(matches_list[0].shape)
+
+    # Find homography
+    H, inliers = cv2.findHomography(points1, points2, cv2.USAC_MAGSAC, 4.0, maxIters=700, confidence=0.995)
+    inliers = inliers.flatten() > 0
+
+    if inliers.sum() < 50:
+        H = None
+
+    kp1 = [cv2.KeyPoint(p[0],p[1], 5) for p in points1[inliers]]
+    kp2 = [cv2.KeyPoint(p[0],p[1], 5) for p in points2[inliers]]
+    good_matches = [cv2.DMatch(i,i,0) for i in range(len(kp1))]
+
+    total_time += time() - t0
+    # Draw matches
+    matched_frame = cv2.drawMatches(img1, kp1, img2, kp2, good_matches, None, matchColor=(0, 200, 0), flags=2)
+
+    color = (240, 89, 169)
+    # Adding captions on the top frame canvas
+    putText(canvas=matched_frame, text="XFeat Matches: %d"%(len(good_matches)), org=(10, 30), fontFace=cv2.FONT_HERSHEY_SIMPLEX, 
+        fontScale=0.9, textColor=(0,0,0), borderColor=color, thickness=1, lineType=cv2.LINE_AA)
+
+cv2.imshow("XFeat Matches", matched_frame)
+cv2.waitKey(0)
+print(total_time)
+print(10/total_time)

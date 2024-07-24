@@ -1,58 +1,90 @@
-"""
-	"XFeat: Accelerated Features for Lightweight Image Matching, CVPR 2024."
-	https://www.verlab.dcc.ufmg.br/descriptors/xfeat_cvpr24/
-
-    Real-time homography estimation demo. Note that scene has to be planar or just rotate the camera for the estimation to work properly.
-"""
-
-import cv2
+from time import sleep, time
+import pyrealsense2 as rs
 import numpy as np
-import torch
-
-from time import time, sleep
-import argparse, sys, tqdm
+import cv2
 import threading
-
+import torch
+import argparse
 from modules.xfeat import XFeat
+import os
+# from modules.model import *
+
+# os.environ['CUDA_VISIBLE_DEVICES'] = ''
+kpt = 200
+width = 640
+height = 480
+
 
 def argparser():
     parser = argparse.ArgumentParser(description="Configurations for the real-time matching demo.")
-    parser.add_argument('--width', type=int, default=640, help='Width of the video capture stream.')
-    parser.add_argument('--height', type=int, default=480, help='Height of the video capture stream.')
-    parser.add_argument('--max_kpts', type=int, default=3_000, help='Maximum number of keypoints.')
+    parser.add_argument('--width', type=int, default=width, help='Width of the video capture stream.')
+    parser.add_argument('--height', type=int, default=height, help='Height of the video capture stream.')
+    parser.add_argument('--max_kpts', type=int, default=kpt, help='Maximum number of keypoints.')
     parser.add_argument('--method', type=str, choices=['ORB', 'SIFT', 'XFeat'], default='XFeat', help='Local feature detection method to use.')
-    parser.add_argument('--cam', type=int, default=0, help='Webcam device number.')
     return parser.parse_args()
 
-
-class FrameGrabber(threading.Thread):
-    def __init__(self, cap):
-        super().__init__()
-        self.cap = cap
-        _, self.frame = self.cap.read()
-        self.running = False
+class FrameGrabber():
+    def __init__(self):
+        self.pipeline = rs.pipeline()
+        self.config = rs.config()
+        # self.config.enable_stream(rs.stream.infrared, 1, 640, 480, rs.format.y8, 15)
+        # self.config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 15)
+        self.config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, 15)
+        self.profile = self.pipeline.start(self.config)
+        self.device = self.profile.get_device()
+        depth_sensor = self.device.query_sensors()[0]
+        if depth_sensor.supports(rs.option.emitter_enabled):
+            depth_sensor.set_option(rs.option.emitter_enabled, 0)
+        self.frame = None
 
     def run(self):
         self.running = True
         while self.running:
-            ret, frame = self.cap.read()
-            if not ret:
-                print("Can't receive frame (stream ended?).")
-            self.frame = frame
-            sleep(0.01)
+            # print("Starting frame grabber")
+            frames = self.pipeline.wait_for_frames()
+
+            # 灰度图像获取
+            # self.frame = frames.get_infrared_frame(1)
+
+            # 彩色图像获取
+            self.frame = frames.get_color_frame()
+            # sleep(0.03)
 
     def stop(self):
         self.running = False
-        self.cap.release()
-
+        self.pipeline.stop()
+    
     def get_last_frame(self):
-        return self.frame
+        # img = np.asanyarray(self.frame.get_data())
+        # img = img[None]
+        return np.asanyarray(self.frame.get_data())
+
+def show_frame(f):
+    while True:
+        current_frame = f.get_last_frame()
+        cv2.imshow('frame', current_frame)
+        key = cv2.waitKey(1)
+        if key == ord('q'):
+            f.stop()
+            cv2.destroyAllWindows()
+            break
+
+def numpy_image_to_torch(image: np.ndarray) -> torch.Tensor:
+    """Normalize the image tensor and reorder the dimensions."""
+    if image.ndim == 3:
+        image = image.transpose((2, 0, 1))  # HxWxC to CxHxW
+    elif image.ndim == 2:
+        image = image[None]  # add channel axis
+    else:
+        raise ValueError(f"Not an image: {image.shape}")
+    return torch.tensor(image / 255.0, dtype=torch.float)
 
 class CVWrapper():
     def __init__(self, mtd):
         self.mtd = mtd
     def detectAndCompute(self, x, mask=None):
-        return self.mtd.detectAndCompute(torch.tensor(x).permute(2,0,1).float()[None])[0]
+        # return self.mtd.detectAndCompute(torch.tensor(x).permute(2,0,1).float()[None])[0]
+        return self.mtd.detectAndCompute(numpy_image_to_torch(x)[None])[0]
 
 class Method:
     def __init__(self, descriptor, matcher):
@@ -60,20 +92,11 @@ class Method:
         self.matcher = matcher
 
 def init_method(method, max_kpts):
-    if method == "ORB":
-        return Method(descriptor=cv2.ORB_create(max_kpts, fastThreshold=10), matcher=cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True))
-    elif method == "SIFT":
-        return Method(descriptor=cv2.SIFT_create(max_kpts, contrastThreshold=-1, edgeThreshold=1000), matcher=cv2.BFMatcher(cv2.NORM_L2, crossCheck=True))
-    elif method == "XFeat":
-        return Method(descriptor=CVWrapper(XFeat(top_k = max_kpts)), matcher=XFeat())
-    else:
-        raise RuntimeError("Invalid Method.")
-
+        Method(descriptor=CVWrapper(XFeat(top_k = max_kpts)), matcher=XFeat())
 
 class MatchingDemo:
     def __init__(self, args):
         self.args = args
-        self.cap = cv2.VideoCapture(args.cam)
         self.width = args.width
         self.height = args.height
         self.ref_frame = None
@@ -81,11 +104,9 @@ class MatchingDemo:
         self.corners = [[50, 50], [640-50, 50], [640-50, 480-50], [50, 480-50]]
         self.current_frame = None
         self.H = None
-        self.setup_camera()
 
         #Init frame grabber thread
-        self.frame_grabber = FrameGrabber(self.cap)
-        self.frame_grabber.start()
+        self.frame_grabber = FrameGrabber()
 
         #Homography params
         self.min_inliers = 50
@@ -94,10 +115,10 @@ class MatchingDemo:
         #FPS check
         self.FPS = 0
         self.time_list = []
-        self.max_cnt = 30 #avg FPS over this number of frames
+        self.max_cnt = 15 #avg FPS over this number of frames
 
         #Set local feature method here -- we expect cv2 or Kornia convention
-        self.method = init_method(args.method, max_kpts=args.max_kpts)
+        self.method = Method(descriptor=CVWrapper(XFeat(top_k = kpt)), matcher=XFeat())
         
         # Setting up font for captions
         self.font = cv2.FONT_HERSHEY_SIMPLEX
@@ -114,17 +135,6 @@ class MatchingDemo:
         cv2.resizeWindow(self.window_name, self.width*2, self.height*2)
         #Set Mouse Callback
         cv2.setMouseCallback(self.window_name, self.mouse_callback)
-
-    def setup_camera(self):
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)
-        #self.cap.set(cv2.CAP_PROP_EXPOSURE, 200)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
-
-        if not self.cap.isOpened():
-            print("Cannot open camera")
-            exit()
 
     def draw_quad(self, frame, point_list):
         if len(self.corners) > 1:
@@ -161,7 +171,12 @@ class MatchingDemo:
         top_frame = np.hstack((self.ref_frame, self.current_frame))
         color = (3, 186, 252)
         cv2.rectangle(top_frame, (2, 2), (self.width*2-2, self.height-2), color, 5)  # Orange color line as a separator
-        top_frame_canvas[0:self.height, 0:self.width*2] = top_frame
+        if top_frame.ndim == 3:
+            top_frame_canvas[0:self.height, 0:self.width*2] = top_frame
+        elif top_frame.ndim == 2:
+            top_frame_canvas[0:self.height, 0:self.width*2, 0] = top_frame
+            top_frame_canvas[0:self.height, 0:self.width*2, 1] = top_frame
+            top_frame_canvas[0:self.height, 0:self.width*2, 2] = top_frame
         
         # Adding captions on the top frame canvas
         self.putText(canvas=top_frame_canvas, text="Reference Frame:", org=(10, 30), fontFace=self.font, 
@@ -175,20 +190,31 @@ class MatchingDemo:
         return top_frame_canvas
 
     def process(self):
-        # Create a blank canvas for the top frame
-        top_frame_canvas = self.create_top_frame()
-
-        # Match features and draw matches on the bottom frame
+        # top_frame_canvas = np.zeros((480, 1280, 3), dtype=np.uint8)
+        # kpts0, kpts1 = self.ref_precomp['keypoints'], self.current['keypoints']
+        # for kp in kpts0:
+        #     x, y = kp
+        #     cv2.circle(self.ref_frame, (int(x), int(y)), 2, (0, 255, 0), -1)
+        # for kp in kpts1:
+        #     x, y = kp
+        #     cv2.circle(self.current_frame, (int(x), int(y)), 2, (0, 255, 0), -1)
+        # self.draw_quad(top_frame_canvas, self.corners)
+        # top_frame = np.hstack((self.ref_frame, self.current_frame))
+        # top_frame_canvas[0:self.height, 0:self.width*2] = top_frame
+        # # Match features and draw matches on the bottom frame
         bottom_frame = self.match_and_draw(self.ref_frame, self.current_frame)
-
-        # Draw warped corners
-        if self.H is not None and len(self.corners) > 1:
-            self.draw_quad(top_frame_canvas, self.warp_points(self.corners, self.H, self.width))
-
-        # Stack top and bottom frames vertically on the final canvas
-        canvas = np.vstack((top_frame_canvas, bottom_frame))
-
+        # canvas = np.vstack((top_frame_canvas, bottom_frame))
+        canvas = bottom_frame
         cv2.imshow(self.window_name, canvas)
+
+        # self.current = self.method.descriptor.detectAndCompute(self.current_frame)
+        # # kpts1, descs1 = self.ref_precomp['keypoints'], self.ref_precomp['descriptors']
+        # kpts2, descs2 = self.current['keypoints'], self.current['descriptors']
+        # for kp in kpts2:
+        #     x, y = kp
+        #     cv2.circle(self.current_frame, (int(x), int(y)), 2, (0, 255, 0), -1)
+        # # plt.figure(figsize=(20, 20))
+        # cv2.imshow("img", self.current_frame)
 
     def match_and_draw(self, ref_frame, current_frame):
 
@@ -201,12 +227,30 @@ class MatchingDemo:
             kp1, des1 = self.ref_precomp
             kp2, des2 = self.method.descriptor.detectAndCompute(current_frame, None)
         else:
-            current = self.method.descriptor.detectAndCompute(current_frame)
+            self.current = self.method.descriptor.detectAndCompute(current_frame)
             kpts1, descs1 = self.ref_precomp['keypoints'], self.ref_precomp['descriptors']
-            kpts2, descs2 = current['keypoints'], current['descriptors']
+            kpts2, descs2 = self.current['keypoints'], self.current['descriptors']
             idx0, idx1 = self.method.matcher.match(descs1, descs2, 0.82)
             points1 = kpts1[idx0].cpu().numpy()
             points2 = kpts2[idx1].cpu().numpy()
+
+            # im_set2 = self.method.matcher.parse_input(current_frame)
+            # #Compute coarse feats
+            # self.current = self.method.matcher.detectAndComputeDense(im_set2, top_k=4800)
+            # #Match batches of pairs
+            # idxs_list = self.method.matcher.batch_match(self.ref_precomp['descriptors'], self.current['descriptors'] )
+            # B = len(im_set2)
+            # # print(B)
+            # #Refine coarse matches
+            # #this part is harder to batch, currently iterate
+            # matches = []
+            # for b in range(B):
+            #     matches.append(self.method.matcher.refine_matches(self.ref_precomp, self.current, matches = idxs_list, batch_idx=b))
+            # if B <= 1:
+            #     # matches = (matches[0][:, :2].cpu().numpy(), matches[0][:, 2:].cpu().numpy())
+            #     matches = (matches[0][:, :2].cpu().detach().numpy(), matches[0][:, 2:].cpu().detach().numpy())
+            # points1 = matches[0]
+            # points2 = matches[1]
 
         if len(kp1) > 10 and len(kp2) > 10 and self.args.method in ['SIFT', 'ORB']:
             # Match descriptors
@@ -220,6 +264,7 @@ class MatchingDemo:
                     points1[i, :] = kp1[match.queryIdx].pt
                     points2[i, :] = kp2[match.trainIdx].pt
 
+        # cv2.drawKeypoints(current_frame, kp2, current_frame, color=(0, 200, 0))
         if len(points1) > 10 and len(points2) > 10:
             # Find homography
             self.H, inliers = cv2.findHomography(points1, points2, cv2.USAC_MAGSAC, self.ransac_thr, maxIters=700, confidence=0.995)
@@ -242,8 +287,7 @@ class MatchingDemo:
             matched_frame = np.hstack([ref_frame, current_frame])
 
         color = (240, 89, 169)
-
-        # Add a colored rectangle to separate from the top frame
+        # # Add a colored rectangle to separate from the top frame
         cv2.rectangle(matched_frame, (2, 2), (self.width*2-2, self.height-2), color, 5)
 
         # Adding captions on the top frame canvas
@@ -258,23 +302,29 @@ class MatchingDemo:
 
     def main_loop(self):
         self.current_frame = self.frame_grabber.get_last_frame()
+        # print(self.current_frame.shape)
         self.ref_frame = self.current_frame.copy()
-        self.ref_precomp = self.method.descriptor.detectAndCompute(self.ref_frame, None) #Cache ref features
-
+        self.current = self.method.descriptor.detectAndCompute(self.current_frame, None)
+        self.ref_precomp = self.current.copy() #Cache ref features
+        # im_set1 = self.method.matcher.parse_input(self.ref_frame)
+        # self.ref_precomp = self.method.matcher.detectAndComputeDense(im_set1, top_k=4800)
+        self.process()
         while True:
             if self.current_frame is None:
                 break
 
             t0 = time()
             self.process()
-
             key = cv2.waitKey(1)
             if key == ord('q'):
+                self.frame_grabber.stop()
                 break
             elif key == ord('s'):
                 self.ref_frame = self.current_frame.copy()  # Update reference frame
                 self.ref_precomp = self.method.descriptor.detectAndCompute(self.ref_frame, None) #Cache ref features
 
+            self.ref_frame = self.current_frame.copy()  # Update reference frame
+            self.ref_precomp = self.current.copy() #Cache ref features
             self.current_frame = self.frame_grabber.get_last_frame()
 
             #Measure avg. FPS
@@ -282,14 +332,34 @@ class MatchingDemo:
             if len(self.time_list) > self.max_cnt:
                 self.time_list.pop(0)
             self.FPS = 1.0 / np.array(self.time_list).mean()
-        
+            # print(self.FPS)
         self.cleanup()
 
     def cleanup(self):
         self.frame_grabber.stop()
-        self.cap.release()
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     demo = MatchingDemo(args = argparser())
+    # demo.main_loop()
+    thread1 = threading.Thread(target=demo.frame_grabber.run)
+    # thread2 = threading.Thread(target=demo.main_loop)
+    thread1.start()
+    sleep(1)
     demo.main_loop()
+    # thread2.start()
+    # thread1.join()
+    # thread2.join()
+
+
+
+# if __name__ == "__main__":
+#     f = FrameGrabber()
+#     thread1 = threading.Thread(target=f.run)
+#     thread2 = threading.Thread(target=show_frame, args=(f,))
+#     thread1.start()
+#     sleep(0.5)
+#     thread2.start()
+
+#     thread1.join()
+#     thread2.join()
